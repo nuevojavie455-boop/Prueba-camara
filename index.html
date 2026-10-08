@@ -1,1 +1,211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cámara → Telegram</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;padding:12px;background:#111;color:#eee;font-family:system-ui,sans-serif}
+  h1{font-size:18px;margin:0 0 10px}
+  input,select,button{width:100%;padding:12px;margin:4px 0;border-radius:8px;border:1px solid #444;background:#222;color:#eee;font-size:15px}
+  button{background:#0a84ff;border:0;font-weight:600}
+  button.sec{background:#333}
+  button.off{background:#c0392b}
+  video{width:100%;border-radius:10px;background:#000;margin-top:6px}
+  #log{font:12px monospace;background:#000;padding:8px;border-radius:8px;height:130px;overflow:auto;white-space:pre-wrap;margin-top:6px}
+  .row{display:flex;gap:6px}
+  label{font-size:12px;color:#aaa}
+</style>
+</head>
+<body>
+<h1>📷 Cámara → Telegram</h1>
 
+<label>Token del bot (BotFather)</label>
+<input id="tok" placeholder="123456:ABC-DEF...">
+<label>Chat ID</label>
+<input id="chat" placeholder="123456789" inputmode="numeric">
+<button id="bId" class="sec">🔍 Buscar mi chat ID automáticamente</button>
+<label>Nombre de esta cámara</label>
+<input id="name" value="Cámara 1">
+
+<div class="row">
+  <button id="bStart">Iniciar cámara</button>
+  <button id="bTest" class="sec">Probar Telegram</button>
+</div>
+
+<video id="v" autoplay playsinline muted></video>
+
+<button id="bPhoto" class="sec">📸 Enviar foto ahora</button>
+<button id="bMotion" class="sec">Detección de movimiento: APAGADA</button>
+<label>Sensibilidad</label>
+<select id="sens">
+  <option value="0.02">Alta</option>
+  <option value="0.05" selected>Media</option>
+  <option value="0.10">Baja</option>
+</select>
+<label>Pausa entre alertas</label>
+<select id="cool">
+  <option value="5000">5 s</option>
+  <option value="15000" selected>15 s</option>
+  <option value="60000">1 min</option>
+</select>
+
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let stream = null, offset = 0, motionOn = false, prev = null, lastSent = 0;
+
+function log(m){
+  const t = new Date().toLocaleTimeString();
+  $('log').textContent += '[' + t + '] ' + m + '\n';
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+function load(){
+  try{
+    $('tok').value  = localStorage.getItem('tg_tok')  || '';
+    $('chat').value = localStorage.getItem('tg_chat') || '';
+    $('name').value = localStorage.getItem('tg_name') || 'Cámara 1';
+  }catch(e){}
+}
+function save(){
+  try{
+    localStorage.setItem('tg_tok',  $('tok').value.trim());
+    localStorage.setItem('tg_chat', $('chat').value.trim());
+    localStorage.setItem('tg_name', $('name').value.trim());
+  }catch(e){}
+}
+const api = m => 'https://api.telegram.org/bot' + $('tok').value.trim() + '/' + m;
+
+async function sendText(text){
+  try{
+    const r = await fetch(api('sendMessage'), {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({chat_id: $('chat').value.trim(), text})
+    });
+    const j = await r.json();
+    if(!j.ok) log('Error Telegram: ' + j.description);
+    return j.ok;
+  }catch(e){ log('Sin conexión: ' + e.message); return false; }
+}
+
+function snap(){
+  const v = $('v');
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  return new Promise(r => c.toBlob(r, 'image/jpeg', 0.8));
+}
+
+async function sendPhoto(motivo){
+  if(!stream){ log('Primero inicia la cámara'); return; }
+  const blob = await snap();
+  const fd = new FormData();
+  fd.append('chat_id', $('chat').value.trim());
+  fd.append('photo', blob, 'foto.jpg');
+  fd.append('caption', motivo + ' (' + $('name').value + ') — ' + new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  try{
+    const r = await fetch(api('sendPhoto'), {method:'POST', body: fd});
+    const j = await r.json();
+    log(j.ok ? 'Foto enviada ✔' : 'Error: ' + j.description);
+  }catch(e){ log('Sin conexión: ' + e.message); }
+}
+
+async function startCam(){
+  save();
+  if(!navigator.mediaDevices || !window.isSecureContext){
+    log('⚠ El navegador bloquea la cámara. Abre la página con https://');
+    return;
+  }
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'}, width:{ideal:1280}}, audio:false
+    });
+    $('v').srcObject = stream;
+    try{ await navigator.wakeLock.request('screen'); }catch(e){}
+    log('Cámara lista');
+    await skipOldMessages();
+    setInterval(pollCommands, 3000);
+    setInterval(checkMotion, 700);
+    sendText('✅ ' + $('name').value + ' conectada.\nComandos: /foto /activar /pausa /estado');
+  }catch(e){ log('No se pudo abrir la cámara: ' + e.message); }
+}
+
+async function skipOldMessages(){
+  try{
+    const r = await fetch(api('getUpdates?offset=-1'));
+    const j = await r.json();
+    if(j.ok && j.result.length) offset = j.result[j.result.length-1].update_id + 1;
+  }catch(e){}
+}
+
+async function pollCommands(){
+  try{
+    const r = await fetch(api('getUpdates?timeout=0&offset=' + offset));
+    const j = await r.json();
+    if(!j.ok) return;
+    for(const u of j.result){
+      offset = u.update_id + 1;
+      const m = u.message;
+      if(!m || String(m.chat.id) !== $('chat').value.trim()) continue;
+      const cmd = (m.text || '').toLowerCase().split('@')[0].trim();
+      if(cmd === '/foto') await sendPhoto('📸 Foto pedida');
+      else if(cmd === '/activar') setMotion(true);
+      else if(cmd === '/pausa') setMotion(false);
+      else if(cmd === '/estado') sendText('Movimiento: ' + (motionOn ? 'ACTIVADO' : 'apagado'));
+    }
+  }catch(e){}
+}
+
+const mc = document.createElement('canvas'); mc.width = 48; mc.height = 36;
+const mx = mc.getContext('2d', {willReadFrequently:true});
+function checkMotion(){
+  if(!stream || !motionOn || !$('v').videoWidth) return;
+  mx.drawImage($('v'), 0, 0, 48, 36);
+  const d = mx.getImageData(0, 0, 48, 36).data;
+  const g = new Uint8Array(48*36);
+  for(let i=0;i<g.length;i++) g[i] = (d[i*4] + d[i*4+1] + d[i*4+2]) / 3;
+  if(prev){
+    let n = 0;
+    for(let i=0;i<g.length;i++) if(Math.abs(g[i]-prev[i]) > 30) n++;
+    const frac = n / g.length;
+    const now = Date.now();
+    if(frac > parseFloat($('sens').value) && now - lastSent > parseInt($('cool').value)){
+      lastSent = now;
+      log('Movimiento: ' + Math.round(frac*100) + '%');
+      sendPhoto('🚨 Movimiento detectado');
+    }
+  }
+  prev = g;
+}
+
+function setMotion(on){
+  motionOn = on; prev = null;
+  $('bMotion').textContent = 'Detección de movimiento: ' + (on ? 'ACTIVADA' : 'APAGADA');
+  $('bMotion').className = on ? 'off' : 'sec';
+  log('Movimiento ' + (on ? 'activado' : 'apagado'));
+}
+
+$('bId').onclick = async () => {
+  save();
+  try{
+    const r = await fetch(api('getUpdates'));
+    const j = await r.json();
+    if(!j.ok){ log('Error: ' + j.description); return; }
+    const m = j.result.map(u => u.message).filter(Boolean).pop();
+    if(!m){ log('Aún no hay mensajes. Abre tu bot, toca Iniciar y escribe hola.'); return; }
+    $('chat').value = m.chat.id; save();
+    log('Chat ID encontrado: ' + m.chat.id);
+  }catch(e){ log('Sin conexión: ' + e.message); }
+};
+$('bStart').onclick  = startCam;
+$('bTest').onclick   = async () => { save(); const ok = await sendText('Prueba desde ' + $('name').value); log(ok ? 'Mensaje de prueba enviado ✔' : 'Revisa token y chat ID'); };
+$('bPhoto').onclick  = () => sendPhoto('📸 Foto manual');
+$('bMotion').onclick = () => setMotion(!motionOn);
+load();
+</script>
+</body>
+</html>
