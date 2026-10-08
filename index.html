@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cámara → Telegram</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <style>
   *{box-sizing:border-box}
   body{margin:0;padding:12px;background:#111;color:#eee;font-family:system-ui,sans-serif}
@@ -12,7 +14,9 @@
   button{background:#0a84ff;border:0;font-weight:600}
   button.sec{background:#333}
   button.off{background:#c0392b}
-  video{width:100%;border-radius:10px;background:#000;margin-top:6px}
+  #wrap{position:relative;margin-top:6px}
+  video{width:100%;display:block;border-radius:10px;background:#000}
+  #ov{position:absolute;left:0;top:0;width:100%;height:100%;border-radius:10px}
   #log{font:12px monospace;background:#000;padding:8px;border-radius:8px;height:130px;overflow:auto;white-space:pre-wrap;margin-top:6px}
   .row{display:flex;gap:6px}
   label{font-size:12px;color:#aaa}
@@ -37,11 +41,26 @@
 </div>
 <button id="bLink" class="sec">🔗 Copiar link mágico (para mi otro celular)</button>
 
-<video id="v" autoplay playsinline muted></video>
+<div id="wrap">
+  <video id="v" autoplay playsinline muted></video>
+  <canvas id="ov"></canvas>
+</div>
+
+<div class="row">
+  <button id="bZone" class="sec">✏️ Marcar zona</button>
+  <button id="bZoneDel" class="sec">🗑 Borrar zona</button>
+</div>
 
 <button id="bPhoto" class="sec">📸 Enviar foto ahora</button>
-<button id="bMotion" class="sec">Detección de movimiento: APAGADA</button>
-<label>Sensibilidad</label>
+<button id="bMotion" class="sec">Vigilancia: APAGADA</button>
+<label>Qué detectar</label>
+<select id="mode">
+  <option value="per" selected>Personas</option>
+  <option value="veh">Vehículos (carro, camión, bus, moto)</option>
+  <option value="all">Personas y vehículos</option>
+  <option value="mov">Cualquier movimiento</option>
+</select>
+<label>Sensibilidad (solo para movimiento)</label>
 <select id="sens">
   <option value="0.02">Alta</option>
   <option value="0.05" selected>Media</option>
@@ -59,6 +78,8 @@
 <script>
 const $ = id => document.getElementById(id);
 let stream = null, offset = 0, motionOn = false, prev = null, lastSent = 0;
+let zone = null, zEdit = false, zStart = null;
+let model = null, loadingModel = false, busy = false, shown = [], lastMatch = [];
 
 function log(m){
   const t = new Date().toLocaleTimeString();
@@ -72,6 +93,7 @@ function load(){
     $('chat').value  = localStorage.getItem('tg_chat')  || '';
     $('clave').value = localStorage.getItem('tg_clave') || '';
     $('name').value  = localStorage.getItem('tg_name')  || 'Cámara 1';
+    zone = JSON.parse(localStorage.getItem('tg_zone') || 'null');
   }catch(e){}
 }
 function save(){
@@ -82,8 +104,8 @@ function save(){
     localStorage.setItem('tg_name',  $('name').value.trim());
   }catch(e){}
 }
+function saveZone(){ try{ localStorage.setItem('tg_zone', JSON.stringify(zone)); }catch(e){} }
 
-// Link mágico: llena los datos desde la dirección y los borra de la barra
 function fromHash(){
   if(!location.hash) return;
   const p = new URLSearchParams(location.hash.slice(1));
@@ -96,7 +118,6 @@ function fromHash(){
   log('Datos cargados desde el link ✔');
 }
 
-// Suscriptores guardados en este celular
 function getSubs(){ try{ return JSON.parse(localStorage.getItem('tg_subs') || '[]'); }catch(e){ return []; } }
 function setSubs(a){ try{ localStorage.setItem('tg_subs', JSON.stringify(a)); }catch(e){} }
 function dests(){
@@ -128,11 +149,25 @@ async function sendText(text, to){
   return ok;
 }
 
+const CLS = {person:'persona', car:'carro', truck:'camión', bus:'bus', motorcycle:'moto', bicycle:'bici'};
+
 function snap(){
   const v = $('v');
   const c = document.createElement('canvas');
   c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v, 0, 0);
+  const x = c.getContext('2d');
+  x.drawImage(v, 0, 0);
+  const lw = Math.max(2, c.width / 300);
+  const fs = Math.round(c.width / 35);
+  if(zone){
+    x.strokeStyle = '#0f6'; x.lineWidth = lw;
+    x.strokeRect(zone.x*c.width, zone.y*c.height, zone.w*c.width, zone.h*c.height);
+  }
+  x.strokeStyle = '#ff0'; x.fillStyle = '#ff0'; x.lineWidth = lw; x.font = fs + 'px sans-serif';
+  lastMatch.forEach(p => {
+    x.strokeRect(p.bbox[0], p.bbox[1], p.bbox[2], p.bbox[3]);
+    x.fillText((CLS[p.class] || p.class) + ' ' + Math.round(p.score*100) + '%', p.bbox[0] + 4, p.bbox[1] + fs);
+  });
   return new Promise(r => c.toBlob(r, 'image/jpeg', 0.8));
 }
 
@@ -169,7 +204,7 @@ async function startCam(){
     log('Cámara lista');
     await skipOldMessages();
     setInterval(pollCommands, 3000);
-    setInterval(checkMotion, 700);
+    setInterval(tick, 700);
     sendText('✅ ' + $('name').value + ' conectada.\nComandos: /foto /activar /pausa /estado', $('chat').value.trim());
   }catch(e){ log('No se pudo abrir la cámara: ' + e.message); }
 }
@@ -213,25 +248,134 @@ async function pollCommands(){
       else if(cmd === '/start' && !isSub) sendText('Para recibir las fotos escribe: /unirme TU_CLAVE', id);
       else if(!isSub) continue;
       else if(cmd === '/foto') await sendPhoto('📸 Foto pedida', id);
-      else if(cmd === '/estado') sendText('Movimiento: ' + (motionOn ? 'ACTIVADO' : 'apagado'), id);
+      else if(cmd === '/estado') sendText('Vigilancia: ' + (motionOn ? 'ACTIVADA' : 'apagada'), id);
       else if(isOwner && cmd === '/activar') setMotion(true);
       else if(isOwner && cmd === '/pausa') setMotion(false);
     }
   }catch(e){}
 }
 
+// ---------- Zona ----------
+function inZone(cx, cy){
+  return !zone || (cx >= zone.x && cx <= zone.x + zone.w && cy >= zone.y && cy <= zone.y + zone.h);
+}
+const ov = $('ov');
+function pt(e){
+  const r = ov.getBoundingClientRect();
+  return {
+    x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+    y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))
+  };
+}
+function drawOv(){
+  const w = ov.clientWidth, h = ov.clientHeight;
+  if(ov.width !== w) ov.width = w;
+  if(ov.height !== h) ov.height = h;
+  const x = ov.getContext('2d');
+  x.clearRect(0, 0, w, h);
+  if(zone){
+    x.fillStyle = 'rgba(0,255,100,0.15)'; x.strokeStyle = '#0f6'; x.lineWidth = 2;
+    x.fillRect(zone.x*w, zone.y*h, zone.w*w, zone.h*h);
+    x.strokeRect(zone.x*w, zone.y*h, zone.w*w, zone.h*h);
+  }
+  const v = $('v');
+  if(v.videoWidth){
+    const sx = w / v.videoWidth, sy = h / v.videoHeight;
+    x.strokeStyle = '#ff0'; x.fillStyle = '#ff0'; x.lineWidth = 2; x.font = '12px sans-serif';
+    shown.forEach(p => {
+      x.strokeRect(p.bbox[0]*sx, p.bbox[1]*sy, p.bbox[2]*sx, p.bbox[3]*sy);
+      x.fillText((CLS[p.class] || p.class) + ' ' + Math.round(p.score*100) + '%', p.bbox[0]*sx + 3, p.bbox[1]*sy + 12);
+    });
+  }
+}
+ov.addEventListener('pointerdown', e => {
+  if(!zEdit) return;
+  zStart = pt(e);
+  zone = {x: zStart.x, y: zStart.y, w: 0, h: 0};
+  try{ ov.setPointerCapture(e.pointerId); }catch(err){}
+});
+ov.addEventListener('pointermove', e => {
+  if(!zEdit || !zStart) return;
+  const p = pt(e);
+  zone = {x: Math.min(zStart.x, p.x), y: Math.min(zStart.y, p.y), w: Math.abs(p.x - zStart.x), h: Math.abs(p.y - zStart.y)};
+  drawOv();
+});
+ov.addEventListener('pointerup', () => {
+  if(!zEdit || !zStart) return;
+  zStart = null; zEdit = false;
+  ov.style.touchAction = 'auto';
+  $('bZone').textContent = '✏️ Marcar zona';
+  if(zone.w < 0.05 || zone.h < 0.05){ zone = null; log('Zona muy pequeña, intenta de nuevo'); }
+  else log('Zona guardada ✔');
+  saveZone(); drawOv();
+});
+$('bZone').onclick = () => {
+  zEdit = true; ov.style.touchAction = 'none';
+  $('bZone').textContent = '👉 Arrastra sobre el video';
+  log('Arrastra con el dedo sobre el video para dibujar la zona');
+};
+$('bZoneDel').onclick = () => { zone = null; saveZone(); drawOv(); log('Zona borrada (se vigila toda la imagen)'); };
+
+// ---------- Detección ----------
+async function ensureModel(){
+  if(model || loadingModel) return;
+  if(typeof cocoSsd === 'undefined'){ log('No cargó el modelo de IA. Revisa tu internet y recarga.'); return; }
+  loadingModel = true;
+  log('Cargando modelo de IA (la primera vez tarda)...');
+  try{
+    model = await cocoSsd.load({base:'lite_mobilenet_v2'});
+    log('Modelo listo ✔');
+  }catch(e){ log('Error del modelo: ' + e.message); }
+  loadingModel = false;
+}
+function wanted(c){
+  const m = $('mode').value;
+  const veh = ['car','truck','bus','motorcycle'];
+  if(m === 'per') return c === 'person';
+  if(m === 'veh') return veh.includes(c);
+  return c === 'person' || veh.includes(c);
+}
+async function checkAI(){
+  if(busy || !model || !$('v').videoWidth) return;
+  busy = true;
+  try{
+    const v = $('v');
+    const preds = await model.detect(v);
+    const vw = v.videoWidth, vh = v.videoHeight;
+    shown = preds.filter(p => p.score > 0.55 && wanted(p.class) &&
+      inZone((p.bbox[0] + p.bbox[2]/2) / vw, (p.bbox[1] + p.bbox[3]/2) / vh));
+    drawOv();
+    const now = Date.now();
+    if(shown.length && now - lastSent > parseInt($('cool').value)){
+      lastSent = now;
+      const cnt = {};
+      shown.forEach(p => { const n = CLS[p.class] || p.class; cnt[n] = (cnt[n] || 0) + 1; });
+      const txt = Object.entries(cnt).map(([k, n]) => n + ' ' + k).join(', ');
+      log('Detectado: ' + txt);
+      lastMatch = shown.slice();
+      await sendPhoto('🚨 ' + txt);
+      lastMatch = [];
+    }
+  }catch(e){}
+  busy = false;
+}
+
 const mc = document.createElement('canvas'); mc.width = 48; mc.height = 36;
 const mx = mc.getContext('2d', {willReadFrequently:true});
 function checkMotion(){
-  if(!stream || !motionOn || !$('v').videoWidth) return;
+  if(!$('v').videoWidth) return;
   mx.drawImage($('v'), 0, 0, 48, 36);
   const d = mx.getImageData(0, 0, 48, 36).data;
   const g = new Uint8Array(48*36);
   for(let i=0;i<g.length;i++) g[i] = (d[i*4] + d[i*4+1] + d[i*4+2]) / 3;
   if(prev){
-    let n = 0;
-    for(let i=0;i<g.length;i++) if(Math.abs(g[i]-prev[i]) > 30) n++;
-    const frac = n / g.length;
+    let n = 0, tot = 0;
+    for(let y=0;y<36;y++) for(let x=0;x<48;x++){
+      if(!inZone((x+0.5)/48, (y+0.5)/36)) continue;
+      const i = y*48 + x; tot++;
+      if(Math.abs(g[i]-prev[i]) > 30) n++;
+    }
+    const frac = tot ? n / tot : 0;
     const now = Date.now();
     if(frac > parseFloat($('sens').value) && now - lastSent > parseInt($('cool').value)){
       lastSent = now;
@@ -242,12 +386,22 @@ function checkMotion(){
   prev = g;
 }
 
+function tick(){
+  if(!stream) return;
+  if(!motionOn){ shown = []; drawOv(); return; }
+  if($('mode').value === 'mov'){ drawOv(); checkMotion(); }
+  else checkAI();
+}
+
 function setMotion(on){
   motionOn = on; prev = null;
-  $('bMotion').textContent = 'Detección de movimiento: ' + (on ? 'ACTIVADA' : 'APAGADA');
+  if(!on) shown = [];
+  if(on && $('mode').value !== 'mov') ensureModel();
+  $('bMotion').textContent = 'Vigilancia: ' + (on ? 'ACTIVADA' : 'APAGADA');
   $('bMotion').className = on ? 'off' : 'sec';
-  log('Movimiento ' + (on ? 'activado' : 'apagado'));
+  log('Vigilancia ' + (on ? 'activada' : 'apagada'));
 }
+$('mode').onchange = () => { prev = null; if(motionOn && $('mode').value !== 'mov') ensureModel(); };
 
 $('bId').onclick = async () => {
   save();
@@ -277,6 +431,7 @@ $('bPhoto').onclick  = () => sendPhoto('📸 Foto manual');
 $('bMotion').onclick = () => setMotion(!motionOn);
 load();
 fromHash();
+drawOv();
 </script>
 </body>
 </html>
