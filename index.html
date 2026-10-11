@@ -662,7 +662,8 @@ $('bStart').onclick  = startCam;
 $('bTest').onclick   = async () => { save(); const ok = await sendText('Prueba desde ' + $('name').value); log(ok ? 'Mensaje de prueba enviado ✔' : 'Revisa token y chat ID'); };
 $('bPhoto').onclick  = () => sendPhoto('📸 Foto manual');
 $('bMotion').onclick = () => setMotion(!motionOn);
-load();
+f('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+ load();
 fromHash();
 drawOv();
 </script>
