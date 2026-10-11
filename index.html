@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cámara → Telegram</title>
- <link rel="manifest" href="manifest.json">
+<link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#111111">
 <link rel="icon" href="icon-192.png">
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
@@ -291,24 +291,56 @@ async function alertar(titulo, detalle){
   await sendPhoto(titulo, undefined, extra, blob);
 }
 
+// ---------- Cámara ----------
+async function openStream(){
+  const tries = [
+    {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}}, audio:false},
+    {video:{facingMode:'environment'}, audio:false},
+    {video:true, audio:false}
+  ];
+  let last;
+  for(const c of tries){
+    try{ return await navigator.mediaDevices.getUserMedia(c); }
+    catch(e){
+      last = e;
+      if(e.name === 'NotAllowedError' || e.name === 'SecurityError') break;
+    }
+  }
+  throw last;
+}
+function camHelp(e){
+  const n = e && e.name;
+  if(n === 'NotAllowedError' || n === 'SecurityError')
+    return 'Permiso de cámara denegado. Ve a Ajustes del celular → Apps → (esta app) → Permisos → Cámara → Permitir. En Chrome: ⋮ → Configuración → Configuración de sitios → Cámara.';
+  if(n === 'NotReadableError' || n === 'AbortError')
+    return 'La cámara está ocupada por otra app. Cierra las demás apps que usen la cámara y vuelve a intentar.';
+  if(n === 'NotFoundError' || n === 'OverconstrainedError')
+    return 'No se encontró una cámara disponible en este celular.';
+  return 'Cierra la app por completo, ábrela de nuevo y toca Iniciar cámara.';
+}
+
 async function startCam(){
   save();
-  if(!navigator.mediaDevices || !window.isSecureContext){
+  if(stream){ log('La cámara ya está iniciada'); return; }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.isSecureContext){
     log('⚠ El navegador bloquea la cámara. Abre la página con https://');
     return;
   }
   try{
-    stream = await navigator.mediaDevices.getUserMedia({
-      video:{facingMode:{ideal:'environment'}, width:{ideal:1280}}, audio:false
-    });
+    stream = await openStream();
     $('v').srcObject = stream;
+    try{ await $('v').play(); }catch(e){}
     try{ await navigator.wakeLock.request('screen'); }catch(e){}
     log('Cámara lista');
     await skipOldMessages();
     setInterval(pollCommands, 3000);
     setInterval(tick, 700);
     sendText('✅ ' + $('name').value + ' conectada.\nComandos: /foto /que /activar /pausa /estado', $('chat').value.trim());
-  }catch(e){ log('No se pudo abrir la cámara: ' + e.message); }
+  }catch(e){
+    stream = null;
+    log('No se pudo abrir la cámara [' + (e && e.name ? e.name : 'error') + ']: ' + (e && e.message ? e.message : ''));
+    log(camHelp(e));
+  }
 }
 
 async function skipOldMessages(){
@@ -662,8 +694,9 @@ $('bStart').onclick  = startCam;
 $('bTest').onclick   = async () => { save(); const ok = await sendText('Prueba desde ' + $('name').value); log(ok ? 'Mensaje de prueba enviado ✔' : 'Revisa token y chat ID'); };
 $('bPhoto').onclick  = () => sendPhoto('📸 Foto manual');
 $('bMotion').onclick = () => setMotion(!motionOn);
-f('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
- load();
+
+if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+load();
 fromHash();
 drawOv();
 </script>
